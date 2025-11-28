@@ -476,11 +476,8 @@ namespace ggml_cuda_mma {
             // contiguous four 64-bit chunks per lane for the wider RDNA3 fragment
             xi[0] = xs[0];
             xi[1] = xs[1];
-            const int64_t * xs1 = xs + 2;
-            xi[2] = xs1[0];
-            xi[3] = xs1[1];
-            //xi[2] = xs[2];
-            //xi[3] = xs[3];
+            xi[2] = xs[2];
+            xi[3] = xs[3];
         }else{
             NO_DEVICE_CODE;
         }
