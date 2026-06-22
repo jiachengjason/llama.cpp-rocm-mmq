@@ -10,3 +10,10 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 void ggml_cuda_op_fused_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int n_fuse);
 void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int n_fuse);
+
+void ggml_cuda_op_moe_combine_residual(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * experts,
+    const ggml_tensor * weights,
+    const ggml_tensor * residual,
+    ggml_tensor * dst);

@@ -498,6 +498,106 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     }
 }
 
+static __global__ void k_moe_combine_residual_f32(
+        const float * experts,
+        const float * weights,
+        const float * residual,
+        float * dst,
+        const int64_t n_cols,
+        const int64_t n_rows,
+        const int64_t n_ids,
+        const int64_t experts_s0,
+        const int64_t experts_s1,
+        const int64_t experts_s2,
+        const int64_t weights_s1,
+        const int64_t weights_s2,
+        const int64_t residual_s0,
+        const int64_t residual_s1,
+        const int64_t dst_s0,
+        const int64_t dst_s1) {
+    // Match the old mul-store + left-fold add sequence: no acc += x*w FMA.
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t total = n_cols*n_rows;
+
+    if (idx >= total) {
+        return;
+    }
+
+    const int64_t row = idx / n_cols;
+    const int64_t col = idx - row*n_cols;
+
+    const int64_t experts_base = row*experts_s2 + col*experts_s0;
+    const int64_t weights_base = row*weights_s2;
+
+    float acc = experts[experts_base] * weights[weights_base];
+    for (int64_t id = 1; id < n_ids; ++id) {
+        acc += experts[experts_base + id*experts_s1] * weights[weights_base + id*weights_s1];
+    }
+
+    dst[row*dst_s1 + col*dst_s0] = residual[row*residual_s1 + col*residual_s0] + acc;
+}
+
+void ggml_cuda_op_moe_combine_residual(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * experts,
+        const ggml_tensor * weights,
+        const ggml_tensor * residual,
+        ggml_tensor * dst) {
+    GGML_ASSERT(experts->type  == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type  == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type      == GGML_TYPE_F32);
+
+    GGML_ASSERT(experts->ne[0] == dst->ne[0]);
+    GGML_ASSERT(experts->ne[2] == dst->ne[1]);
+    GGML_ASSERT(experts->ne[3] == 1);
+    GGML_ASSERT(weights->ne[0] == 1);
+    GGML_ASSERT(weights->ne[1] == experts->ne[1]);
+    GGML_ASSERT(weights->ne[2] == experts->ne[2]);
+    GGML_ASSERT(weights->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(residual, dst));
+
+    GGML_ASSERT(experts->nb[0]  % sizeof(float) == 0);
+    GGML_ASSERT(experts->nb[1]  % sizeof(float) == 0);
+    GGML_ASSERT(experts->nb[2]  % sizeof(float) == 0);
+    GGML_ASSERT(weights->nb[1]  % sizeof(float) == 0);
+    GGML_ASSERT(weights->nb[2]  % sizeof(float) == 0);
+    GGML_ASSERT(residual->nb[0] % sizeof(float) == 0);
+    GGML_ASSERT(residual->nb[1] % sizeof(float) == 0);
+    GGML_ASSERT(dst->nb[0]      % sizeof(float) == 0);
+    GGML_ASSERT(dst->nb[1]      % sizeof(float) == 0);
+
+    const int64_t n_cols = dst->ne[0];
+    const int64_t n_rows = dst->ne[1];
+    const int64_t n_ids  = experts->ne[1];
+
+    const int block_size = 256;
+    const int64_t total = n_cols*n_rows;
+    const int64_t n_blocks = (total + block_size - 1) / block_size;
+
+    const ggml_cuda_kernel_launch_params launch_params(dim3(n_blocks), dim3(block_size), 0, ctx.stream());
+    ggml_cuda_kernel_launch(k_moe_combine_residual_f32, launch_params,
+        (const float *) experts->data,
+        (const float *) weights->data,
+        (const float *) residual->data,
+        (float *) dst->data,
+        n_cols,
+        n_rows,
+        n_ids,
+        (int64_t) (experts->nb[0] / sizeof(float)),
+        (int64_t) (experts->nb[1] / sizeof(float)),
+        (int64_t) (experts->nb[2] / sizeof(float)),
+        (int64_t) (weights->nb[1] / sizeof(float)),
+        (int64_t) (weights->nb[2] / sizeof(float)),
+        (int64_t) (residual->nb[0] / sizeof(float)),
+        (int64_t) (residual->nb[1] / sizeof(float)),
+        (int64_t) (dst->nb[0] / sizeof(float)),
+        (int64_t) (dst->nb[1] / sizeof(float)));
+}
+
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 

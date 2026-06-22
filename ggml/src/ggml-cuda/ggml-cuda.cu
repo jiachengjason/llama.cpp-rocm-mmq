@@ -3830,6 +3830,142 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a == nullptr || b == nullptr || a->buffer == nullptr || b->buffer == nullptr ||
+            a->data == nullptr || b->data == nullptr) {
+        return false;
+    }
+
+    const uintptr_t a_start = (uintptr_t) a->data;
+    const uintptr_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+    const uintptr_t b_start = (uintptr_t) b->data;
+    const uintptr_t b_end   = b_start + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+
+    return a_start < b_end && b_start < a_end;
+}
+
+static bool ggml_cuda_try_moe_combine_residual_fusion(
+        const ggml_cgraph * cgraph,
+        int i,
+        const ggml_tensor ** experts,
+        const ggml_tensor ** weights,
+        const ggml_tensor ** residual,
+        ggml_tensor ** dst,
+        int * nodes_to_skip) {
+    ggml_tensor * mul_node = cgraph->nodes[i];
+    if (mul_node->op != GGML_OP_MUL || mul_node->type != GGML_TYPE_F32 ||
+            mul_node->ne[3] != 1 || mul_node->ne[1] < 2 || mul_node->ne[1] > 32) {
+        return false;
+    }
+
+    const int64_t n_cols = mul_node->ne[0];
+    const int64_t n_ids  = mul_node->ne[1];
+    const int64_t n_rows = mul_node->ne[2];
+
+    const ggml_tensor * src0 = mul_node->src[0];
+    const ggml_tensor * src1 = mul_node->src[1];
+    if (src0 == nullptr || src1 == nullptr || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const auto is_experts = [&](const ggml_tensor * t) {
+        return t->ne[0] == n_cols && t->ne[1] == n_ids && t->ne[2] == n_rows && t->ne[3] == 1;
+    };
+    const auto is_weights = [&](const ggml_tensor * t) {
+        return t->ne[0] == 1 && t->ne[1] == n_ids && t->ne[2] == n_rows && t->ne[3] == 1;
+    };
+
+    const ggml_tensor * experts_src = nullptr;
+    const ggml_tensor * weights_src = nullptr;
+    if (is_experts(src0) && is_weights(src1)) {
+        experts_src = src0;
+        weights_src = src1;
+    } else if (is_experts(src1) && is_weights(src0)) {
+        experts_src = src1;
+        weights_src = src0;
+    } else {
+        return false;
+    }
+
+    const int count = (int) (2*n_ids + 1);
+    if (i + count > cgraph->n_nodes) {
+        return false;
+    }
+
+    std::vector<ggml_op> ops(count);
+    ops[0] = GGML_OP_MUL;
+    for (int64_t id = 0; id < n_ids; ++id) {
+        ops[1 + id] = GGML_OP_VIEW;
+    }
+    for (int64_t id = 0; id < n_ids; ++id) {
+        ops[1 + n_ids + id] = GGML_OP_ADD;
+    }
+
+    std::vector<int> idxs(count);
+    for (int j = 0; j < count; ++j) {
+        idxs[j] = i + j;
+    }
+
+    std::vector<ggml_tensor *> views(n_ids);
+    for (int64_t id = 0; id < n_ids; ++id) {
+        ggml_tensor * view = cgraph->nodes[i + 1 + id];
+        if (view->op != GGML_OP_VIEW || view->src[0] != mul_node || view->view_src != mul_node ||
+                view->type != GGML_TYPE_F32 ||
+                view->ne[0] != n_cols || view->ne[1] != n_rows || view->ne[2] != 1 || view->ne[3] != 1 ||
+                view->nb[0] != mul_node->nb[0] || view->nb[1] != mul_node->nb[2] ||
+                view->view_offs != (size_t) id*mul_node->nb[1]) {
+            return false;
+        }
+        views[id] = view;
+    }
+
+    ggml_tensor * acc = views[0];
+    for (int64_t id = 1; id < n_ids; ++id) {
+        ggml_tensor * add = cgraph->nodes[i + (int) n_ids + (int) id];
+        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+                add->src[0] != acc || add->src[1] != views[id] ||
+                add->ne[0] != n_cols || add->ne[1] != n_rows || add->ne[2] != 1 || add->ne[3] != 1) {
+            return false;
+        }
+        acc = add;
+    }
+
+    ggml_tensor * add_residual = cgraph->nodes[i + count - 1];
+    const ggml_tensor * residual_src = nullptr;
+    if (add_residual->src[0] == acc) {
+        residual_src = add_residual->src[1];
+    } else if (add_residual->src[1] == acc) {
+        residual_src = add_residual->src[0];
+    } else {
+        return false;
+    }
+
+    if (add_residual->op != GGML_OP_ADD || add_residual->type != GGML_TYPE_F32 ||
+            residual_src == nullptr || residual_src->type != GGML_TYPE_F32 ||
+            add_residual->ne[0] != n_cols || add_residual->ne[1] != n_rows ||
+            add_residual->ne[2] != 1 || add_residual->ne[3] != 1 ||
+            !ggml_are_same_shape(add_residual, residual_src)) {
+        return false;
+    }
+
+    const int output_idx = i + count - 1;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), count, ops.data(), &output_idx, 1)) {
+        return false;
+    }
+
+    if (ggml_cuda_tensors_overlap(add_residual, experts_src) ||
+            ggml_cuda_tensors_overlap(add_residual, weights_src)) {
+        return false;
+    }
+
+    *experts       = experts_src;
+    *weights       = weights_src;
+    *residual      = residual_src;
+    *dst           = add_residual;
+    *nodes_to_skip = count - 1;
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3960,6 +4096,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // MoE FFN tail: per-expert weight scale + expert combine + residual add.
+    {
+        const ggml_tensor * experts  = nullptr;
+        const ggml_tensor * weights  = nullptr;
+        const ggml_tensor * residual = nullptr;
+        ggml_tensor * dst = nullptr;
+        int nodes_to_skip = 0;
+        if (ggml_cuda_try_moe_combine_residual_fusion(cgraph, i, &experts, &weights, &residual, &dst, &nodes_to_skip)) {
+            ggml_cuda_op_moe_combine_residual(*cuda_ctx, experts, weights, residual, dst);
+            return nodes_to_skip;
         }
     }
 
