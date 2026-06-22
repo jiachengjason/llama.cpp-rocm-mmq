@@ -4129,7 +4129,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
-    // gate + add + glu + up + add
+    // mul mat + add + add
+    if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
+        ggml_tensor * mm_node       = cgraph->nodes[i];
+        ggml_tensor * add_node_0    = cgraph->nodes[i + 1];
+        ggml_tensor * add_node_1    = cgraph->nodes[i + 2];
+        ggml_tensor * bias_tensor   = nullptr;
+        ggml_tensor * residual      = nullptr;
+
+        if (add_node_0->src[0] == mm_node) {
+            bias_tensor = add_node_0->src[1];
+        } else if (add_node_0->src[1] == mm_node) {
+            bias_tensor = add_node_0->src[0];
+        }
+
+        if (add_node_1->src[0] == add_node_0) {
+            residual = add_node_1->src[1];
+        } else if (add_node_1->src[1] == add_node_0) {
+            residual = add_node_1->src[0];
+        }
+
+        if (bias_tensor && residual &&
+                bias_tensor->type == GGML_TYPE_F32 &&
+                residual->type == GGML_TYPE_F32 &&
+                bias_tensor->ne[0] == add_node_1->ne[0] &&
+                ggml_are_same_shape(add_node_0->src[0], add_node_0->src[1]) &&
+                ggml_are_same_shape(residual, add_node_1) &&
+                ggml_are_same_stride(residual, add_node_1) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.x_bias     = bias_tensor;
+            fusion_data.x_residual = residual;
+
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], add_node_1, &fusion_data);
+            fused_mul_mat_vec = true;
+            fused_node_count  = 3;
+        }
+    }
+
+    if (fused_mul_mat_vec) {
+        return fused_node_count - 1;
+    }
+
+    // mul mat + add
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
