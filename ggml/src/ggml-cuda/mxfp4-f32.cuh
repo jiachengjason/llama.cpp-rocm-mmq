@@ -7,4 +7,4 @@ bool ggml_cuda_should_use_mxfp4_f32(
 
 void ggml_cuda_mul_mat_mxfp4_f32(
     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-    ggml_tensor * dst);
+    ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
