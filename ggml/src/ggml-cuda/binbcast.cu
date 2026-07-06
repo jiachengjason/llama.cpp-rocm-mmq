@@ -515,6 +515,7 @@ static __global__ void k_moe_combine_residual_f32(
         const int64_t residual_s1,
         const int64_t dst_s0,
         const int64_t dst_s1) {
+    // Fuses experts[:, id, row] * weights[id, row] reduction plus residual add.
     // Match the old mul-store + left-fold add sequence: no acc += x*w FMA.
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -529,6 +530,7 @@ static __global__ void k_moe_combine_residual_f32(
     const int64_t row = idx / n_cols;
     const int64_t col = idx - row*n_cols;
 
+    // Strides are in float elements; experts has logical layout [cols, ids, rows].
     const int64_t experts_base = row*experts_s2 + col*experts_s0;
     const int64_t weights_base = row*weights_s2;
 
@@ -546,6 +548,7 @@ void ggml_cuda_op_moe_combine_residual(
         const ggml_tensor * weights,
         const ggml_tensor * residual,
         ggml_tensor * dst) {
+    // Specialized to the MoE combine tail produced by the gpt-oss graph.
     GGML_ASSERT(experts->type  == GGML_TYPE_F32);
     GGML_ASSERT(weights->type  == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);

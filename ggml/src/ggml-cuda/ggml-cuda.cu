@@ -3836,6 +3836,7 @@ static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor *
         return false;
     }
 
+    // Use allocation ranges, not just tensor base pointers, to catch aliased views.
     const uintptr_t a_start = (uintptr_t) a->data;
     const uintptr_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
     const uintptr_t b_start = (uintptr_t) b->data;
@@ -3887,6 +3888,7 @@ static bool ggml_cuda_try_moe_combine_residual_fusion(
         return false;
     }
 
+    // Expected chain: MUL, one VIEW per expert id, left-fold ADDs, then residual ADD.
     const int count = (int) (2*n_ids + 1);
     if (i + count > cgraph->n_nodes) {
         return false;
@@ -3908,6 +3910,7 @@ static bool ggml_cuda_try_moe_combine_residual_fusion(
 
     std::vector<ggml_tensor *> views(n_ids);
     for (int64_t id = 0; id < n_ids; ++id) {
+        // Each view slices experts[:, id, :] out of the MUL result.
         ggml_tensor * view = cgraph->nodes[i + 1 + id];
         if (view->op != GGML_OP_VIEW || view->src[0] != mul_node || view->view_src != mul_node ||
                 view->type != GGML_TYPE_F32 ||
@@ -3921,6 +3924,7 @@ static bool ggml_cuda_try_moe_combine_residual_fusion(
 
     ggml_tensor * acc = views[0];
     for (int64_t id = 1; id < n_ids; ++id) {
+        // Preserve the original left-fold add order for closer floating-point parity.
         ggml_tensor * add = cgraph->nodes[i + (int) n_ids + (int) id];
         if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
                 add->src[0] != acc || add->src[1] != views[id] ||
@@ -3953,6 +3957,7 @@ static bool ggml_cuda_try_moe_combine_residual_fusion(
         return false;
     }
 
+    // The fused kernel writes dst while reading experts and weights.
     if (ggml_cuda_tensors_overlap(add_residual, experts_src) ||
             ggml_cuda_tensors_overlap(add_residual, weights_src)) {
         return false;
@@ -4278,7 +4283,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
-    // mul mat + add + add
+    // Wo projection epilogue: matmul + bias + residual, restricted to MMVQ.
     if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
         ggml_tensor * mm_node       = cgraph->nodes[i];
         ggml_tensor * add_node_0    = cgraph->nodes[i + 1];
@@ -4298,6 +4303,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             residual = add_node_1->src[0];
         }
 
+        // Residual must match dst layout; MMVQ indexes it through dst strides.
         if (bias_tensor && residual &&
                 bias_tensor->type == GGML_TYPE_F32 &&
                 residual->type == GGML_TYPE_F32 &&

@@ -556,6 +556,7 @@ static __global__ void mul_mat_vec_q(
             }
         }
         if (use_residual) {
+            // Residual uses dst layout; host validation requires matching shape and stride.
             x_residual = x_residual + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
             if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
                 (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
@@ -662,6 +663,7 @@ static __global__ void mul_mat_vec_q(
                     result += x_residuals[j];
                 }
                 if (use_gate) {
+                    // Existing GLU fusion remains after additive epilogue terms.
                     float gate_value = tmp_gate[j][threadIdx.x];
                     if (use_gate_bias) {
                         gate_value += gate_biases[j];
@@ -1179,6 +1181,7 @@ void ggml_cuda_mul_mat_vec_q(
         if (fusion->x_residual) {
             GGML_ASSERT(fusion->x_residual->type == GGML_TYPE_F32);
             GGML_ASSERT(ggml_are_same_shape(fusion->x_residual, dst));
+            // Kernel reuses dst strides for residual addressing.
             GGML_ASSERT(ggml_are_same_stride(fusion->x_residual, dst));
             fusion_local.x_residual = fusion->x_residual->data;
         }
