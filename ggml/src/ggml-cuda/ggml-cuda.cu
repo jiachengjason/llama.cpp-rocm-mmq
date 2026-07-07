@@ -3830,140 +3830,144 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Return whether two tensor allocation ranges overlap.
 static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
-    if (a == nullptr || b == nullptr || a->buffer == nullptr || b->buffer == nullptr ||
+
+    if (a == nullptr || b == nullptr || a->buffer == nullptr || b->buffer == nullptr || // Missing tensors or buffers cannot be compared safely. Missing data pointers mean there is no usable range to compare.
             a->data == nullptr || b->data == nullptr) {
-        return false;
+        return false; // Treat incomplete tensor metadata as non-overlapping.
     }
 
-    const uintptr_t a_start = (uintptr_t) a->data;
-    const uintptr_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
-    const uintptr_t b_start = (uintptr_t) b->data;
-    const uintptr_t b_end   = b_start + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+    const uintptr_t a_start = (uintptr_t) a->data; // Convert tensor a's data pointer to an integer range start.
+    const uintptr_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a); // Compute tensor a's allocation range end.
+    const uintptr_t b_start = (uintptr_t) b->data; // Convert tensor b's data pointer to an integer range start.
+    const uintptr_t b_end   = b_start + ggml_backend_buft_get_alloc_size(b->buffer->buft, b); // Compute tensor b's allocation range end.
 
-    return a_start < b_end && b_start < a_end;
+    return a_start < b_end && b_start < a_end; // Ranges overlap when each range starts before the other range ends.
 }
 
-static bool ggml_cuda_try_moe_combine_residual_fusion(
-        const ggml_cgraph * cgraph,
-        int i,
-        const ggml_tensor ** experts,
-        const ggml_tensor ** weights,
-        const ggml_tensor ** residual,
-        ggml_tensor ** dst,
-        int * nodes_to_skip) {
-    ggml_tensor * mul_node = cgraph->nodes[i];
-    if (mul_node->op != GGML_OP_MUL || mul_node->type != GGML_TYPE_F32 ||
-            mul_node->ne[3] != 1 || mul_node->ne[1] < 2 || mul_node->ne[1] > 32) {
+static bool ggml_cuda_try_moe_combine_residual_fusion( // Match the gpt-oss MoE combine tail and expose fused-kernel arguments.
+        const ggml_cgraph * cgraph, // Graph that owns the candidate node sequence.
+        int i, // Index of the first candidate node in the graph.
+        const ggml_tensor ** experts, // Output slot for the expert tensor input.
+        const ggml_tensor ** weights, // Output slot for the routing weights tensor input.
+        const ggml_tensor ** residual, // Output slot for the residual tensor input.
+        ggml_tensor ** dst, // Output slot for the final destination tensor.
+        int * nodes_to_skip) { // Output slot for the number of graph nodes consumed after node i.
+
+    ggml_tensor * mul_node = cgraph->nodes[i]; // The fused pattern must start at this MUL node.
+
+    if (mul_node->op != GGML_OP_MUL || mul_node->type != GGML_TYPE_F32 || // Require an F32 MUL as the weighted expert product.
+            mul_node->ne[3] != 1 || mul_node->ne[1] < 2 || mul_node->ne[1] > 32) { // Require one batch plane and a supported expert-id count.
         return false;
     }
 
-    const int64_t n_cols = mul_node->ne[0];
-    const int64_t n_ids  = mul_node->ne[1];
-    const int64_t n_rows = mul_node->ne[2];
+    const int64_t n_cols = mul_node->ne[0]; // Expert/output column count.
+    const int64_t n_ids  = mul_node->ne[1]; // Number of selected expert ids.
+    const int64_t n_rows = mul_node->ne[2]; // Expert/output row count.
 
-    const ggml_tensor * src0 = mul_node->src[0];
-    const ggml_tensor * src1 = mul_node->src[1];
-    if (src0 == nullptr || src1 == nullptr || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+    const ggml_tensor * src0 = mul_node->src[0]; // First operand of the weighted expert MUL.
+    const ggml_tensor * src1 = mul_node->src[1]; // Second operand of the weighted expert MUL.
+    if (src0 == nullptr || src1 == nullptr || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) { // Both MUL inputs must exist and be F32.
         return false;
     }
 
-    const auto is_experts = [&](const ggml_tensor * t) {
-        return t->ne[0] == n_cols && t->ne[1] == n_ids && t->ne[2] == n_rows && t->ne[3] == 1;
+    const auto is_experts = [&](const ggml_tensor * t) { // Helper that recognizes the expert tensor shape.
+        return t->ne[0] == n_cols && t->ne[1] == n_ids && t->ne[2] == n_rows && t->ne[3] == 1; // Experts are [cols, ids, rows, 1].
     };
-    const auto is_weights = [&](const ggml_tensor * t) {
-        return t->ne[0] == 1 && t->ne[1] == n_ids && t->ne[2] == n_rows && t->ne[3] == 1;
+    const auto is_weights = [&](const ggml_tensor * t) { // Helper that recognizes the weights tensor shape.
+        return t->ne[0] == 1 && t->ne[1] == n_ids && t->ne[2] == n_rows && t->ne[3] == 1; // Weights are [1, ids, rows, 1].
     };
 
     const ggml_tensor * experts_src = nullptr;
     const ggml_tensor * weights_src = nullptr;
-    if (is_experts(src0) && is_weights(src1)) {
-        experts_src = src0;
-        weights_src = src1;
-    } else if (is_experts(src1) && is_weights(src0)) {
-        experts_src = src1;
-        weights_src = src0;
-    } else {
-        return false;
+    if (is_experts(src0) && is_weights(src1)) { // Handle experts * weights operand order.
+        experts_src = src0; // Record src0 as the expert tensor.
+        weights_src = src1; // Record src1 as the weights tensor.
+    } else if (is_experts(src1) && is_weights(src0)) { // Handle weights * experts operand order.
+        experts_src = src1; // Record src1 as the expert tensor.
+        weights_src = src0; // Record src0 as the weights tensor.
+    } else { // Neither MUL operand order matches the expected expert/weight shapes.
+        return false; // Reject this graph sequence because the MUL is not the MoE combine product.
     }
 
-    const int count = (int) (2*n_ids + 1);
-    if (i + count > cgraph->n_nodes) {
-        return false;
+    const int count = (int) (2*n_ids + 1); // Expected nodes: 1 MUL, n_ids VIEWs, and n_ids ADDs.
+    if (i + count > cgraph->n_nodes) { // Ensure the full candidate sequence fits in the graph.
+        return false; // Reject truncated graph tails.
     }
 
-    std::vector<ggml_op> ops(count);
-    ops[0] = GGML_OP_MUL;
-    for (int64_t id = 0; id < n_ids; ++id) {
-        ops[1 + id] = GGML_OP_VIEW;
+    std::vector<ggml_op> ops(count); // Build the expected operation sequence for subgraph fusion validation.
+    ops[0] = GGML_OP_MUL; // The first node must be the weighted expert MUL.
+    for (int64_t id = 0; id < n_ids; ++id) { // Fill the per-expert VIEW operations.
+        ops[1 + id] = GGML_OP_VIEW; // Each VIEW slices one expert-id plane from the MUL result.
     }
-    for (int64_t id = 0; id < n_ids; ++id) {
-        ops[1 + n_ids + id] = GGML_OP_ADD;
-    }
-
-    std::vector<int> idxs(count);
-    for (int j = 0; j < count; ++j) {
-        idxs[j] = i + j;
+    for (int64_t id = 0; id < n_ids; ++id) { // Fill the ADD operations for the reduction plus residual.
+        ops[1 + n_ids + id] = GGML_OP_ADD; // Each ADD belongs to the left-fold expert sum or final residual add.
     }
 
-    std::vector<ggml_tensor *> views(n_ids);
-    for (int64_t id = 0; id < n_ids; ++id) {
-        ggml_tensor * view = cgraph->nodes[i + 1 + id];
-        if (view->op != GGML_OP_VIEW || view->src[0] != mul_node || view->view_src != mul_node ||
-                view->type != GGML_TYPE_F32 ||
-                view->ne[0] != n_cols || view->ne[1] != n_rows || view->ne[2] != 1 || view->ne[3] != 1 ||
-                view->nb[0] != mul_node->nb[0] || view->nb[1] != mul_node->nb[2] ||
-                view->view_offs != (size_t) id*mul_node->nb[1]) {
+    std::vector<int> idxs(count); // Build graph node indices that correspond to the expected op sequence.
+    for (int j = 0; j < count; ++j) { // Walk every node in the candidate fused subgraph.
+        idxs[j] = i + j; // Store the absolute graph index for this candidate node.
+    } // End node-index fill.
+
+    std::vector<ggml_tensor *> views(n_ids); // Store each per-expert VIEW for later left-fold ADD validation.
+    for (int64_t id = 0; id < n_ids; ++id) { // Validate one VIEW node for each selected expert id.
+        ggml_tensor * view = cgraph->nodes[i + 1 + id]; // The VIEW nodes immediately follow the MUL node.
+        if (view->op != GGML_OP_VIEW || view->src[0] != mul_node || view->view_src != mul_node || // VIEW must reference the MUL result directly.
+                view->type != GGML_TYPE_F32 || // VIEW output must remain F32.
+                view->ne[0] != n_cols || view->ne[1] != n_rows || view->ne[2] != 1 || view->ne[3] != 1 || // VIEW shape must be [cols, rows, 1, 1].
+                view->nb[0] != mul_node->nb[0] || view->nb[1] != mul_node->nb[2] || // VIEW strides must map columns and rows from the MUL result.
+                view->view_offs != (size_t) id*mul_node->nb[1]) { // VIEW offset must select the expected expert-id plane.
             return false;
         }
-        views[id] = view;
+        views[id] = view; // Save the validated VIEW for the later ADD chain check.
     }
 
-    ggml_tensor * acc = views[0];
-    for (int64_t id = 1; id < n_ids; ++id) {
-        ggml_tensor * add = cgraph->nodes[i + (int) n_ids + (int) id];
-        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
-                add->src[0] != acc || add->src[1] != views[id] ||
-                add->ne[0] != n_cols || add->ne[1] != n_rows || add->ne[2] != 1 || add->ne[3] != 1) {
-            return false;
+    ggml_tensor * acc = views[0]; // The left-fold expert reduction starts from expert id 0.
+    for (int64_t id = 1; id < n_ids; ++id) { // Validate the left-fold ADD chain for expert ids 1..n_ids-1.
+        ggml_tensor * add = cgraph->nodes[i + (int) n_ids + (int) id]; // Each reduction ADD follows all VIEW nodes.
+        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || // Reduction node must be an F32 ADD.
+                add->src[0] != acc || add->src[1] != views[id] || // ADD must combine the running accumulator with the next VIEW.
+                add->ne[0] != n_cols || add->ne[1] != n_rows || add->ne[2] != 1 || add->ne[3] != 1) { // ADD output shape must match one output slice.
+            return false; // Reject reordered or shape-incompatible reduction ADDs.
         }
-        acc = add;
+        acc = add; // Advance the accumulator to the newly validated ADD output.
     }
 
-    ggml_tensor * add_residual = cgraph->nodes[i + count - 1];
-    const ggml_tensor * residual_src = nullptr;
-    if (add_residual->src[0] == acc) {
-        residual_src = add_residual->src[1];
-    } else if (add_residual->src[1] == acc) {
-        residual_src = add_residual->src[0];
-    } else {
-        return false;
+    ggml_tensor * add_residual = cgraph->nodes[i + count - 1]; // The final node should add the residual to the expert sum.
+    const ggml_tensor * residual_src = nullptr; // This will hold whichever final ADD input is not the expert accumulator.
+    if (add_residual->src[0] == acc) { // Handle accumulator + residual operand order.
+        residual_src = add_residual->src[1]; // The second input is the residual tensor.
+    } else if (add_residual->src[1] == acc) { // Handle residual + accumulator operand order.
+        residual_src = add_residual->src[0]; // The first input is the residual tensor.
+    } else { // The final ADD does not consume the expert accumulator.
+        return false; // Reject because the candidate tail is not expert sum plus residual.
     }
 
-    if (add_residual->op != GGML_OP_ADD || add_residual->type != GGML_TYPE_F32 ||
-            residual_src == nullptr || residual_src->type != GGML_TYPE_F32 ||
-            add_residual->ne[0] != n_cols || add_residual->ne[1] != n_rows ||
-            add_residual->ne[2] != 1 || add_residual->ne[3] != 1 ||
-            !ggml_are_same_shape(add_residual, residual_src)) {
-        return false;
+    if (add_residual->op != GGML_OP_ADD || add_residual->type != GGML_TYPE_F32 || // Final node must be an F32 ADD.
+            residual_src == nullptr || residual_src->type != GGML_TYPE_F32 || // Residual must exist and be F32.
+            add_residual->ne[0] != n_cols || add_residual->ne[1] != n_rows || // Final output must have expected columns and rows.
+            add_residual->ne[2] != 1 || add_residual->ne[3] != 1 || // Final output must have singleton higher dimensions.
+            !ggml_are_same_shape(add_residual, residual_src)) { // Residual must match the final output shape.
+        return false; // Reject incompatible residual ADDs.
     }
 
-    const int output_idx = i + count - 1;
-    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), count, ops.data(), &output_idx, 1)) {
-        return false;
+    const int output_idx = i + count - 1; // The fused subgraph output is the final residual ADD node.
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), count, ops.data(), &output_idx, 1)) { // Ask the graph helper whether this exact sequence is fusible.
+        return false; // Reject if any intermediate use or graph constraint prevents fusion.
     }
 
-    if (ggml_cuda_tensors_overlap(add_residual, experts_src) ||
-            ggml_cuda_tensors_overlap(add_residual, weights_src)) {
-        return false;
+    if (ggml_cuda_tensors_overlap(add_residual, experts_src) || // Avoid overwriting output storage that aliases experts.
+            ggml_cuda_tensors_overlap(add_residual, weights_src)) { // Avoid overwriting output storage that aliases weights.
+        return false; // Reject unsafe in-place aliasing cases.
     }
 
-    *experts       = experts_src;
-    *weights       = weights_src;
-    *residual      = residual_src;
-    *dst           = add_residual;
-    *nodes_to_skip = count - 1;
-    return true;
+    *experts       = experts_src; // Return the expert tensor
+    *weights       = weights_src; // Return the routing weights
+    *residual      = residual_src; // Return the residual tensor
+    *dst           = add_residual; // Return the final ADD output as the fused destination.
+    *nodes_to_skip = count - 1; // Tell the caller to skip the remaining fused nodes after node i.
+    return true; // Report that the MoE combine + residual fusion matched successfully.
 }
 
 // try and fuse nodes and return the number of nodes to skip

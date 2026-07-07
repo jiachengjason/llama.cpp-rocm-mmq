@@ -499,103 +499,106 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
 }
 
 static __global__ void k_moe_combine_residual_f32(
-        const float * experts,
-        const float * weights,
-        const float * residual,
-        float * dst,
-        const int64_t n_cols,
-        const int64_t n_rows,
-        const int64_t n_ids,
-        const int64_t experts_s0,
-        const int64_t experts_s1,
-        const int64_t experts_s2,
-        const int64_t weights_s1,
-        const int64_t weights_s2,
-        const int64_t residual_s0,
-        const int64_t residual_s1,
-        const int64_t dst_s0,
-        const int64_t dst_s1) {
-    // Match the old mul-store + left-fold add sequence: no acc += x*w FMA.
+        const float * experts,      // Expert tensor data, logically [cols, ids, rows].
+        const float * weights,      // Routing weights data, logically [1, ids, rows].
+        const float * residual,     // Residual tensor data with dst-compatible shape.
+        float * dst,                // Output tensor data for residual + weighted experts.
+        const int64_t n_cols,       // Number of output columns.
+        const int64_t n_rows,       // Number of output rows.
+        const int64_t n_ids,        // Number of selected expert ids to reduce.
+        const int64_t experts_s0,   // Expert stride for the column dimension, in floats.
+        const int64_t experts_s1,   // Expert stride for the expert-id dimension, in floats.
+        const int64_t experts_s2,   // Expert stride for the row dimension, in floats.
+        const int64_t weights_s1,   // Weight stride for the expert-id dimension, in floats.
+        const int64_t weights_s2,   // Weight stride for the row dimension, in floats.
+        const int64_t residual_s0,  // Residual stride for the column dimension, in floats.
+        const int64_t residual_s1,  // Residual stride for the row dimension, in floats.
+        const int64_t dst_s0,       // Destination stride for the column dimension, in floats.
+        const int64_t dst_s1) {     // Destination stride for the row dimension, in floats.
+
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #endif
-    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    const int64_t total = n_cols*n_rows;
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; // Flatten this CUDA thread to one output element.
+    const int64_t total = n_cols*n_rows;                               // Total number of dst elements
 
+    // Ignore threads outside the logical output range.
     if (idx >= total) {
         return;
     }
 
-    const int64_t row = idx / n_cols;
-    const int64_t col = idx - row*n_cols;
+    const int64_t row = idx / n_cols;       // Convert the flat element index to a row.
+    const int64_t col = idx - row*n_cols;   // Convert the flat element index to a column.
 
-    const int64_t experts_base = row*experts_s2 + col*experts_s0;
-    const int64_t weights_base = row*weights_s2;
+    const int64_t experts_base = row*experts_s2 + col*experts_s0; // Base offset for experts[col, 0, row].
+    const int64_t weights_base = row*weights_s2;                  // Base offset for weights[0, 0, row].
 
-    float acc = experts[experts_base] * weights[weights_base];
-    for (int64_t id = 1; id < n_ids; ++id) {
-        acc += experts[experts_base + id*experts_s1] * weights[weights_base + id*weights_s1];
+    float acc = experts[experts_base] * weights[weights_base]; // Start the left-fold reduction with expert id 0.
+    for (int64_t id = 1; id < n_ids; ++id) {                   // Accumulate the remaining selected expert ids in order.
+        acc += experts[experts_base + id*experts_s1] * weights[weights_base + id*weights_s1]; // Add expert[id] * weight[id].
     }
 
-    dst[row*dst_s1 + col*dst_s0] = residual[row*residual_s1 + col*residual_s0] + acc;
+    dst[row*dst_s1 + col*dst_s0] = residual[row*residual_s1 + col*residual_s0] + acc; // Store residual + weighted expert sum.
 }
 
 void ggml_cuda_op_moe_combine_residual(
         ggml_backend_cuda_context & ctx,
-        const ggml_tensor * experts,
-        const ggml_tensor * weights,
-        const ggml_tensor * residual,
-        ggml_tensor * dst) {
+        const ggml_tensor * experts,      // Expert tensor input, expected as F32 [cols, ids, rows, 1].
+        const ggml_tensor * weights,      // Weight tensor input, expected as F32 [1, ids, rows, 1].
+        const ggml_tensor * residual,     // Residual tensor input, expected to match dst shape.
+        ggml_tensor * dst) {              // Destination tensor for the fused output.
+
+    // Experts, Weights, Residual and Destination must be F32 because the kernel reads float pointers.
     GGML_ASSERT(experts->type  == GGML_TYPE_F32);
     GGML_ASSERT(weights->type  == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type      == GGML_TYPE_F32);
 
-    GGML_ASSERT(experts->ne[0] == dst->ne[0]);
-    GGML_ASSERT(experts->ne[2] == dst->ne[1]);
-    GGML_ASSERT(experts->ne[3] == 1);
-    GGML_ASSERT(weights->ne[0] == 1);
-    GGML_ASSERT(weights->ne[1] == experts->ne[1]);
-    GGML_ASSERT(weights->ne[2] == experts->ne[2]);
-    GGML_ASSERT(weights->ne[3] == 1);
-    GGML_ASSERT(ggml_are_same_shape(residual, dst));
+    GGML_ASSERT(experts->ne[0] == dst->ne[0]);      // Expert columns must map to destination columns.
+    GGML_ASSERT(experts->ne[2] == dst->ne[1]);      // Expert rows must map to destination rows.
+    GGML_ASSERT(experts->ne[3] == 1);               // The fused kernel only handles one experts batch plane.
+    GGML_ASSERT(weights->ne[0] == 1);               // Weights are scalar per expert id and row.
+    GGML_ASSERT(weights->ne[1] == experts->ne[1]);  // Weights must cover every selected expert id.
+    GGML_ASSERT(weights->ne[2] == experts->ne[2]);  // Weights must cover every expert row.
+    GGML_ASSERT(weights->ne[3] == 1);               // The fused kernel only handles one weights batch plane.
+    GGML_ASSERT(ggml_are_same_shape(residual, dst)); // Residual and destination must have identical logical shape.
 
-    GGML_ASSERT(experts->nb[0]  % sizeof(float) == 0);
-    GGML_ASSERT(experts->nb[1]  % sizeof(float) == 0);
-    GGML_ASSERT(experts->nb[2]  % sizeof(float) == 0);
-    GGML_ASSERT(weights->nb[1]  % sizeof(float) == 0);
-    GGML_ASSERT(weights->nb[2]  % sizeof(float) == 0);
-    GGML_ASSERT(residual->nb[0] % sizeof(float) == 0);
-    GGML_ASSERT(residual->nb[1] % sizeof(float) == 0);
-    GGML_ASSERT(dst->nb[0]      % sizeof(float) == 0);
-    GGML_ASSERT(dst->nb[1]      % sizeof(float) == 0);
+    GGML_ASSERT(experts->nb[0]  % sizeof(float) == 0);  // Expert column stride must convert cleanly to float units.
+    GGML_ASSERT(experts->nb[1]  % sizeof(float) == 0);  // Expert id stride
+    GGML_ASSERT(experts->nb[2]  % sizeof(float) == 0);  // Expert row stride
+    GGML_ASSERT(weights->nb[1]  % sizeof(float) == 0);  // Weight id stride
+    GGML_ASSERT(weights->nb[2]  % sizeof(float) == 0);  // Weight row stride
+    GGML_ASSERT(residual->nb[0] % sizeof(float) == 0);  // Residual column stride
+    GGML_ASSERT(residual->nb[1] % sizeof(float) == 0);  // Residual row stride
+    GGML_ASSERT(dst->nb[0]      % sizeof(float) == 0);  // Destination column stride
+    GGML_ASSERT(dst->nb[1]      % sizeof(float) == 0);  // Destination row stride
 
-    const int64_t n_cols = dst->ne[0];
-    const int64_t n_rows = dst->ne[1];
-    const int64_t n_ids  = experts->ne[1];
+    const int64_t n_cols = dst->ne[0];      // Kernel width comes from destination columns.
+    const int64_t n_rows = dst->ne[1];      // Kernel height comes from destination rows.
+    const int64_t n_ids  = experts->ne[1];  // Reduction length comes from selected expert ids.
 
-    const int block_size = 256;
-    const int64_t total = n_cols*n_rows;
-    const int64_t n_blocks = (total + block_size - 1) / block_size;
+    const int block_size = 256;                                  // Use 256 threads per block for one element per thread.
+    const int64_t total = n_cols*n_rows;                         // Launch one logical CUDA thread per output element.
+    const int64_t n_blocks = (total + block_size - 1) / block_size; // Round up blocks to cover all output elements.
 
-    const ggml_cuda_kernel_launch_params launch_params(dim3(n_blocks), dim3(block_size), 0, ctx.stream());
-    ggml_cuda_kernel_launch(k_moe_combine_residual_f32, launch_params,
-        (const float *) experts->data,
-        (const float *) weights->data,
-        (const float *) residual->data,
-        (float *) dst->data,
-        n_cols,
-        n_rows,
-        n_ids,
-        (int64_t) (experts->nb[0] / sizeof(float)),
-        (int64_t) (experts->nb[1] / sizeof(float)),
-        (int64_t) (experts->nb[2] / sizeof(float)),
-        (int64_t) (weights->nb[1] / sizeof(float)),
-        (int64_t) (weights->nb[2] / sizeof(float)),
-        (int64_t) (residual->nb[0] / sizeof(float)),
-        (int64_t) (residual->nb[1] / sizeof(float)),
-        (int64_t) (dst->nb[0] / sizeof(float)),
-        (int64_t) (dst->nb[1] / sizeof(float)));
+    const ggml_cuda_kernel_launch_params launch_params(dim3(n_blocks), dim3(block_size), 0, ctx.stream()); // Bind grid, block, shared memory, and stream.
+    ggml_cuda_kernel_launch(k_moe_combine_residual_f32, launch_params, // Launch the fused MoE combine + residual kernel.
+        (const float *) experts->data,                      // Pass expert data as F32 input.
+        (const float *) weights->data,                      // Pass weight data as F32 input.
+        (const float *) residual->data,                     // Pass residual data as F32 input.
+        (float *) dst->data,                                // Pass destination data as F32 output.
+        n_cols,                                             // Pass output column count.
+        n_rows,                                             // Pass output row count.
+        n_ids,                                              // Pass number of expert ids to reduce.
+        (int64_t) (experts->nb[0] / sizeof(float)),         // Pass expert column stride in float units.
+        (int64_t) (experts->nb[1] / sizeof(float)),         // Pass expert id stride
+        (int64_t) (experts->nb[2] / sizeof(float)),         // Pass expert row stride
+        (int64_t) (weights->nb[1] / sizeof(float)),         // Pass weight id stride
+        (int64_t) (weights->nb[2] / sizeof(float)),         // Pass weight row stride
+        (int64_t) (residual->nb[0] / sizeof(float)),        // Pass residual column stride
+        (int64_t) (residual->nb[1] / sizeof(float)),        // Pass residual row stride
+        (int64_t) (dst->nb[0] / sizeof(float)),             // Pass destination column stride
+        (int64_t) (dst->nb[1] / sizeof(float)));            // Pass destination row stride
 }
 
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
