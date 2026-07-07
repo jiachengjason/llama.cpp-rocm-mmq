@@ -1503,7 +1503,6 @@ struct ggml_backend_cuda_context {
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias     = nullptr;
-    // Optional MMVQ epilogue residual; host validation requires dst-compatible layout.
     const ggml_tensor * x_residual = nullptr;
     const ggml_tensor * gate       = nullptr;
     const ggml_tensor * gate_bias  = nullptr;
@@ -1511,7 +1510,6 @@ struct ggml_cuda_mm_fusion_args_host {
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias     = nullptr;
-    // MMVQ kernels address this with dst strides after host shape/stride checks.
     const void * x_residual = nullptr;
     const void * gate       = nullptr;
     const void * gate_bias  = nullptr;
